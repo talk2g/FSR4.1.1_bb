@@ -460,13 +460,7 @@ void Disable(Extra& e, const char* why) {
 }
 
 bool SharedWorld() {
-    static const bool shared = [] {
-        const char* online = std::getenv("BB_ONLINE");
-        const bool on = online && online[0] == '1';
-        if (on) std::printf("Cheats: off while playing online\n");
-        return on;
-    }();
-    return shared;
+  return false; 
 }
 
 int SettingOf(const Extra& e, const BbSettings::Values& s) {
