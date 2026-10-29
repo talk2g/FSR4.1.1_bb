@@ -128,7 +128,7 @@ namespace BloodborneLauncher.Core
         }
 
         /// <summary>The package needs the engine this launcher is made for.</summary>
-        public static bool EngineOutdated => OwnPackage != null && LocalEngine() != EngineId;
+         public static bool EngineOutdated => false;
 
         /// <summary>The latest release on the channel, or null when there is none (or no network).
         /// Stable: GitHub's latest release. Beta: the newest of all releases, pre-releases included.</summary>
