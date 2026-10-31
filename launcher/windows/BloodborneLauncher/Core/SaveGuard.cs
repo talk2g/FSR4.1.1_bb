@@ -28,7 +28,7 @@ namespace BloodborneLauncher.Core
         private static readonly object Lock = new();
 
         public static string VaultDir =>
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Lantern Engine", "save-vault");
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ported engine", "save-vault");
 
         /// <summary>Saves the launcher can point at instead: `Root` is a saves folder with
         /// `Profiles` holding saves; or, when that folder is gone, `Copy` is the vault's newest copy
@@ -209,7 +209,7 @@ namespace BloodborneLauncher.Core
         {
             var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
             var files = new List<string>();
-            foreach (var folder in new[] { "Lantern Engine", "bbport-launcher" })
+            foreach (var folder in new[] { "ported engine", "Lantern Engine", "bbport-launcher" })
             {
                 var dir = Path.Combine(appData, folder);
                 if (!Directory.Exists(dir)) continue;
