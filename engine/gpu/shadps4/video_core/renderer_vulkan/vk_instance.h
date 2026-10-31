@@ -336,6 +336,10 @@ public:
         return fsr4vk;
     }
 
+    bool IsFsrSdkAvailable() const {
+        return fsr_sdk;
+    }
+
     /// bbport: FSR 4.1.1 can run, by the replay (IsFsr411Supported) or through fsr4vk.
     bool IsFsr411Available() const {
         return IsFsr4Int8Supported() && (mixed_float_dot_product || fsr4vk);
@@ -381,6 +385,10 @@ public:
     /// bbport: VK_NV_low_latency2 is enabled for its boost hint (Swapchain), without Streamline.
     bool IsLowLatencyBoostEnabled() const {
         return low_latency_boost;
+    }
+
+    bool IsLowVramAmd() const {
+        return low_vram_amd;
     }
 
     /// Returns the vendor ID of the physical device
@@ -584,6 +592,8 @@ public:
     /// (VK_EXT_memory_budget: what this process can use now, other processes included).
     [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
 
+    [[nodiscard]] u64 GetVmaFreeInBlocks() const;
+
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
@@ -676,11 +686,14 @@ private:
     bool shader_clock{};
     bool compute_shader_derivatives{};
     bool mixed_float_dot_product{}; // bbport: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
+    bool fsr_sdk{};
     bool fsr4vk{};                  // bbport: the device features of the fsr4vk provider are enabled
     bool dlss_extensions{};         // bbport: VK_NVX_binary_import + VK_NVX_image_view_handle
     bool full_screen_exclusive{};   // bbport: VK_EXT_full_screen_exclusive (Windows)
     bool hdr_metadata{};            // bbport: VK_EXT_hdr_metadata
     bool low_latency_boost{};       // bbport: VK_NV_low_latency2 (+ VK_KHR_present_id), boost hint
+    bool anti_lag{};
+    bool low_vram_amd{};
     bool cooperative_matrix{};      // bbport: VK_KHR_cooperative_matrix (FSR 4.1.1 FP8 variant)
     bool shader_float8{};           // bbport: VK_EXT_shader_float8 with FP8 matrices (RDNA4)
     bool supports_memory_budget{};

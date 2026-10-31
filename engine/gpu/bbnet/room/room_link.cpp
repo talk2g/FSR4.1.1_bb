@@ -9,7 +9,10 @@
 
 namespace BbRoom {
 
-std::string RoomUrl(const std::string& server, const std::string& room_id) {
+constexpr int kLossyTarget = 0x80;
+constexpr std::size_t kMostGameBacklog = 8 * 1024;
+
+std::string RoomUrl(const std::string& server, const std::string& room_id, const std::string& path) {
     std::string base = server;
     while (!base.empty() && base.back() == '/') base.pop_back();
     if (base.rfind("https://", 0) == 0) {
@@ -19,14 +22,14 @@ std::string RoomUrl(const std::string& server, const std::string& room_id) {
     } else if (base.rfind("wss://", 0) != 0 && base.rfind("ws://", 0) != 0) {
         base = "wss://" + base;
     }
-    return base + "/room/" + room_id;
+    return base + "/" + path + "/" + room_id;
 }
 
 Link::Link() = default;
 
 Link::~Link() { Stop(); }
 
-bool Link::Start(const std::string& server, const std::string& name, const std::string& password) {
+bool Link::Start(const std::string& server, const std::string& name, const std::string& password, const std::string& path) {
     Stop();
     if (server.empty() || name.empty()) return false;
     secret_ = Derive(name, password);
@@ -38,7 +41,10 @@ bool Link::Start(const std::string& server, const std::string& name, const std::
         member.push_back(digits[byte >> 4]);
         member.push_back(digits[byte & 15]);
     }
-    url_ = RoomUrl(server, secret_.room_id) + "/" + member;
+    url_ = RoomUrl(server, secret_.room_id, path) + "/" + member;
+    if (visitor_ && path == "room") url_ += "?visitor=1";
+    name_ = name;
+    password_ = password;
     stop_ = false;
     thread_ = std::thread([this] { Run(); });
     return true;
@@ -59,8 +65,10 @@ void Link::Stop() {
     connected_ = false;
     slot_ = 0;
     host_ = 0;
+    open_listed_ = false;
     std::lock_guard lock(mutex_);
     members_.clear();
+    visitors_.clear();
 }
 
 bool Link::Send(int target, const std::uint8_t* data, std::size_t size) {
@@ -77,6 +85,49 @@ bool Link::Send(int target, const std::uint8_t* data, std::size_t size) {
     return socket && socket->Send(sealed.data(), sealed.size(), true);
 }
 
+bool Link::SendLossy(int target, const std::uint8_t* data, std::size_t size, std::size_t most_backlog) {
+    const int slot = slot_.load();
+    if (!connected_ || !slot || target == slot || target < 0 || target > 255) return false;
+    auto sealed = Seal(secret_.key, static_cast<std::uint8_t>(slot), data, size);
+    if (sealed.empty()) return false;
+    sealed.insert(sealed.begin(), static_cast<std::uint8_t>(target));
+    std::shared_ptr<WebSocket> socket;
+    {
+        std::lock_guard lock(socket_mutex_);
+        socket = socket_;
+    }
+    return socket && socket->SendLossy(sealed.data(), sealed.size(), most_backlog);
+}
+
+bool Link::SendGame(int target, const std::uint8_t* data, std::size_t size) {
+    const int slot = slot_.load();
+    if (!connected_ || !slot || target == slot || target < 0 || target > 127) return false;
+    auto sealed = Seal(secret_.key, static_cast<std::uint8_t>(slot), data, size);
+    if (sealed.empty()) return false;
+    const int flagged = lossy_targets_.load() ? target | kLossyTarget : target;
+    sealed.insert(sealed.begin(), static_cast<std::uint8_t>(flagged));
+    std::shared_ptr<WebSocket> socket;
+    {
+        std::lock_guard lock(socket_mutex_);
+        socket = socket_;
+    }
+    return socket && socket->SendLossy(sealed.data(), sealed.size(), kMostGameBacklog);
+}
+
+bool Link::SendPaced(int target, const std::uint8_t* data, std::size_t size) {
+    const int slot = slot_.load();
+    if (!connected_ || !slot || target == slot || target < 0 || target > 127) return false;
+    auto sealed = Seal(secret_.key, static_cast<std::uint8_t>(slot), data, size);
+    if (sealed.empty()) return false;
+    sealed.insert(sealed.begin(), static_cast<std::uint8_t>(target));
+    std::shared_ptr<WebSocket> socket;
+    {
+        std::lock_guard lock(socket_mutex_);
+        socket = socket_;
+    }
+    return socket && socket->SendPaced(sealed.data(), sealed.size());
+}
+
 void Link::SetHost(bool host) {
     want_host_ = host;
     std::shared_ptr<WebSocket> socket;
@@ -86,6 +137,39 @@ void Link::SetHost(bool host) {
     }
     const std::string text = host ? R"({"t":"host"})" : R"({"t":"unhost"})";
     if (socket && connected_) socket->Send(text.data(), text.size(), false);
+}
+
+void Link::SendOpen(WebSocket& socket) {
+    const std::string text = want_open_
+        ? nlohmann::json{{"t", "open"}, {"room", name_}, {"password", password_}}.dump()
+        : std::string(R"({"t":"unopen"})");
+    socket.Send(text.data(), text.size(), false);
+}
+
+void Link::SetOpen(bool open) {
+    if (want_open_.exchange(open) == open) return;
+    if (!open) open_listed_ = false;
+    std::shared_ptr<WebSocket> socket;
+    {
+        std::lock_guard lock(socket_mutex_);
+        socket = socket_;
+    }
+    if (socket && connected_) SendOpen(*socket);
+}
+
+void Link::SendAway(int slot) {
+    std::shared_ptr<WebSocket> socket;
+    {
+        std::lock_guard lock(socket_mutex_);
+        socket = socket_;
+    }
+    const std::string text = nlohmann::json{{"t", "away"}, {"slot", slot}}.dump();
+    if (socket && connected_) socket->Send(text.data(), text.size(), false);
+}
+
+bool Link::IsVisitor(int slot) const {
+    std::lock_guard lock(mutex_);
+    return std::find(visitors_.begin(), visitors_.end(), slot) != visitors_.end();
 }
 
 std::vector<Event> Link::Drain() {
@@ -114,10 +198,10 @@ void Link::Push(Event event) {
     cv_.notify_all();
 }
 
-constexpr auto kGiveUpAfter = std::chrono::minutes(2);
+constexpr auto kGiveUpAfter = std::chrono::minutes(10);
 
 void Link::Run() {
-    int backoff_ms = 500;
+    int backoff_ms = 100;
     auto reached = std::chrono::steady_clock::now();
     while (!stop_) {
         const bool welcomed = Session();
@@ -128,7 +212,7 @@ void Link::Run() {
             Push({Event::Kind::GaveUp, 0, {}});
             break;
         }
-        backoff_ms = welcomed ? 500 : std::min(backoff_ms * 2, 8000);
+        backoff_ms = welcomed ? 100 : std::min(backoff_ms * 2, 8000);
         std::unique_lock lock(mutex_);
         cv_.wait_for(lock, std::chrono::milliseconds(backoff_ms), [this] { return stop_.load(); });
     }
@@ -154,9 +238,11 @@ bool Link::Session() {
             Handle(message);
             if (!was && connected_) {
                 welcomed = true;
+                if (lossy_targets_.load()) socket->WatchClosely();
                 if (want_host_) {
                     const std::string text = R"({"t":"host"})";
                     socket->Send(text.data(), text.size(), false);
+                    if (want_open_) SendOpen(*socket);
                 }
             }
             return;
@@ -175,9 +261,11 @@ bool Link::Session() {
         {
             std::lock_guard lock(mutex_);
             members_.clear();
+            visitors_.clear();
         }
         slot_ = 0;
         host_ = 0;
+        open_listed_ = false;
         Push({Event::Kind::Disconnected, 0, {}});
     } else if (!welcomed && !stop_) {
         Push({Event::Kind::Refused, 0, {}});
@@ -200,9 +288,22 @@ void Link::Handle(const std::string& text) {
         {
             std::lock_guard lock(mutex_);
             members_ = members;
+            devs_.clear();
+            if (message.contains("devs") && message["devs"].is_array()) {
+                for (const auto& d : message["devs"]) {
+                    if (d.is_number_integer()) devs_.push_back(d.get<int>());
+                }
+            }
+            visitors_.clear();
+            if (message.contains("visitors") && message["visitors"].is_array()) {
+                for (const auto& v : message["visitors"]) {
+                    if (v.is_number_integer()) visitors_.push_back(v.get<int>());
+                }
+            }
         }
         slot_ = slot;
         host_ = message.value("host", 0);
+        lossy_targets_ = message.value("lossy", false);
         connected_ = true;
         Push({Event::Kind::Connected, slot, {}});
         for (const int m : members) Push({Event::Kind::Joined, m, {}});
@@ -213,16 +314,40 @@ void Link::Handle(const std::string& text) {
             if (std::find(members_.begin(), members_.end(), slot) == members_.end()) members_.push_back(slot);
         }
         Push({Event::Kind::Joined, slot, {}});
+    } else if (type == "dev") {
+        std::lock_guard lock(mutex_);
+        devs_.push_back(slot);
     } else if (type == "leave") {
         {
             std::lock_guard lock(mutex_);
             members_.erase(std::remove(members_.begin(), members_.end(), slot), members_.end());
+            devs_.erase(std::remove(devs_.begin(), devs_.end(), slot), devs_.end());
+            visitors_.erase(std::remove(visitors_.begin(), visitors_.end(), slot), visitors_.end());
         }
         Push({Event::Kind::Left, slot, {}});
+    } else if (type == "visitor") {
+        {
+            std::lock_guard lock(mutex_);
+            if (std::find(visitors_.begin(), visitors_.end(), slot) == visitors_.end()) visitors_.push_back(slot);
+        }
+        Push({Event::Kind::Visitor, slot, {}});
+    } else if (type == "opened") {
+        open_listed_ = message.value("on", false);
     } else if (type == "host") {
         host_ = slot;
         Push({Event::Kind::Host, slot, {}});
+    } else if (type == "announce" && message.contains("text") && message["text"].is_string() &&
+               message.contains("id") && message["id"].is_number_unsigned()) {
+        const std::string words = message["text"].get<std::string>();
+        Event event{Event::Kind::Announcement, 0, {words.begin(), words.end()}};
+        event.id = message["id"].get<std::uint64_t>();
+        Push(std::move(event));
     }
+}
+
+bool Link::IsDev(int slot) const {
+    std::lock_guard lock(mutex_);
+    return std::find(devs_.begin(), devs_.end(), slot) != devs_.end();
 }
 
 } // namespace BbRoom

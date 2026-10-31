@@ -254,6 +254,8 @@ def main():
         os.environ['BB_FSR411_DIR'] = str(data / 'fsr4_411')
     if 'BB_FSR4VK_DIR' not in os.environ and (ROOT / 'fsr4vk' / 'amd_fidelityfx_upscaler_vk.dll').is_file():
         os.environ['BB_FSR4VK_DIR'] = str(ROOT / 'fsr4vk')
+    if 'BB_FSR_SDK_DIR' not in os.environ and (ROOT / 'fsr_sdk' / 'amd_fidelityfx_loader_vk.dll').is_file():
+        os.environ['BB_FSR_SDK_DIR'] = str(ROOT / 'fsr_sdk')
     remembered = out / 'game_dir.txt'
     if not game and remembered.is_file():
         game = remembered.read_text(encoding='utf-8').strip()
@@ -265,7 +267,23 @@ def main():
     os.environ['BB_GAME_DIR'] = str(original)
     os.environ['BB_RESTART_COMMAND'] = subprocess.list2cmdline([PYTHON, str(Path(__file__).resolve()), *sys.argv[1:]])
 
-    merged = Path(run([PYTHON, SCRIPTS / 'mods.py', original, '--out', out,
+    first_layers = []
+    try:
+        chosen = json.loads(Path(os.environ.get('BB_PATCHES_CONFIG', data / 'patches.json')).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        chosen = {}
+    lamp2lamp_bosses = 'Bloodborne.xml/Lamp2Lamp: warp to bosses' in chosen.get('enabled', [])
+    if lamp2lamp_bosses or 'Bloodborne.xml/Lamp2Lamp (warp between lamps)' in chosen.get('enabled', []):
+        try:
+            import engine_assets, mods
+            for name in ('lamp2lamp', 'lamp2lamp-bosses') if lamp2lamp_bosses else ('lamp2lamp',):
+                layer = engine_assets.prepare_lamp2lamp(original, mods.update_folder(original), PACKAGE / 'engine' / f'{name}.bin',
+                                                        data / 'engine-assets')
+                first_layers += ['--first-layer', layer]
+            print('Engine: Lamp2Lamp on', flush=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f'Engine: Lamp2Lamp off: {error}', flush=True)
+    merged = Path(run([PYTHON, SCRIPTS / 'mods.py', original, '--out', out, *first_layers,
                        '--mods-dir', os.environ.get('BB_MODS_DIR', data / 'mods'),
                        '--config', os.environ.get('BB_MODS_CONFIG', data / 'mods.json'),
                        '--enabled', os.environ.get('BB_MODS_ENABLED', '1')], capture=True))

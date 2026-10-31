@@ -44,6 +44,20 @@ Folders Locate() {
     return f;
 }
 
+std::optional<std::string> PlateTitle(const std::map<std::string, std::string>& settings, const char* key) {
+    const auto set = Setting(settings, key);
+    if (!set) return std::optional<std::string>(std::string());
+    std::string title;
+    for (const char c : *set)
+        if (std::uint8_t(c) >= 0x20 && c != 0x7f) title.push_back(c);
+    if (title.size() > 48) {
+        title.resize(48);
+        while (!title.empty() && (std::uint8_t(title.back()) & 0xc0) == 0x80) title.pop_back();
+        if (!title.empty() && std::uint8_t(title.back()) >= 0xc0) title.pop_back();
+    }
+    return title;
+}
+
 std::optional<std::string> SettingValue(const fs::path& config, const std::string& key) {
     return Setting(ReadSettings(config), key);
 }
@@ -328,6 +342,8 @@ int Main(std::vector<std::wstring> arguments) {
         SetEnv("BB_FSR411_DIR", Utf8(data / "fsr4_411"));
     if (!Env("BB_FSR4VK_DIR") && fs::is_regular_file(folders.engine / "fsr4vk" / "amd_fidelityfx_upscaler_vk.dll", error))
         SetEnv("BB_FSR4VK_DIR", Utf8(folders.engine / "fsr4vk"));
+    if (!Env("BB_FSR_SDK_DIR") && fs::is_regular_file(folders.engine / "fsr_sdk" / "amd_fidelityfx_loader_vk.dll", error))
+        SetEnv("BB_FSR_SDK_DIR", Utf8(folders.engine / "fsr_sdk"));
     const fs::path remembered = out / "game_dir.txt";
     if ((!game || game->empty()) && fs::is_regular_file(remembered, error)) game = Trim(ReadText(remembered));
     const fs::path game_dir = game && !game->empty() ? Path(*game) : folders.package.parent_path() / "CUSA03173";
@@ -346,8 +362,36 @@ int Main(std::vector<std::wstring> arguments) {
 
     fs::path merged;
     try {
+        const bool own_font = fs::is_regular_file(original / "dvdroot_ps4" / "font" / "DbgFont14h.ccm", error) &&
+                              fs::is_regular_file(original / "dvdroot_ps4" / "font" / "DbgFont14h.tpf", error);
+        const bool debug_font = Setting(settings, "debug_menu") == "1" && !own_font && fs::is_directory(folders.engine / "debug-font", error);
+        std::vector<fs::path> first_layers;
+        if (debug_font) first_layers.push_back(folders.engine / "debug-font");
+        bool lamp2lamp = false, lamp2lamp_bosses = false;
+        try {
+            const auto chosen = nlohmann::json::parse(ReadText(Path(Env("BB_PATCHES_CONFIG", Utf8(data / "patches.json")))));
+            if (chosen.contains("enabled"))
+                for (const auto& key : chosen.at("enabled")) {
+                    lamp2lamp = lamp2lamp || key == "Bloodborne.xml/Lamp2Lamp (warp between lamps)";
+                    lamp2lamp_bosses = lamp2lamp_bosses || key == "Bloodborne.xml/Lamp2Lamp: warp to bosses";
+                }
+        } catch (const std::exception&) {
+        }
+        if (lamp2lamp || lamp2lamp_bosses) {
+            try {
+                const auto update = GameUpdateFolder(original);
+                const fs::path core = PrepareLamp2Lamp(original, update, folders.engine / "lamp2lamp.bin", data / "engine-assets");
+                const fs::path bosses = lamp2lamp_bosses ? PrepareLamp2Lamp(original, update, folders.engine / "lamp2lamp-bosses.bin", data / "engine-assets") : fs::path();
+                first_layers.push_back(core);
+                if (lamp2lamp_bosses) first_layers.push_back(bosses);
+                Log("Engine: Lamp2Lamp on%s", lamp2lamp_bosses ? ", with warps to bosses" : "");
+            } catch (const std::exception& e) {
+                Log("Engine: Lamp2Lamp off: %s", e.what());
+            }
+        }
         merged = BuildModsOverlay(original, out, Path(Env("BB_MODS_DIR", Utf8(data / "mods"))),
-                                  Path(Env("BB_MODS_CONFIG", Utf8(data / "mods.json"))), Env("BB_MODS_ENABLED", "1") == "1");
+                                  Path(Env("BB_MODS_CONFIG", Utf8(data / "mods.json"))), Env("BB_MODS_ENABLED", "1") == "1",
+                                  first_layers);
     } catch (const std::exception& e) {
         Log("Mods: %s", e.what());
         return 1;
@@ -423,11 +467,21 @@ int Main(std::vector<std::wstring> arguments) {
                 Log("Engine: Dream mirror skipped: %s", e.what());
             }
         }
+        if (Setting(settings, "ui_4k") != "0") {
+            std::error_code ui_error;
+            const fs::path ui = data / "engine-assets" / "ui-4k";
+            if (fs::is_regular_file(ui / "complete", ui_error)) {
+                SetEnv("BB_UI_4K", Utf8(ui));
+                Log("Engine: 4K menu textures from %s", Utf8(ui).c_str());
+            }
+        }
         if (is_on("change_appearance") || is_on("camera_controls") || is_on("rebirth") || is_on("graphics_controls") ||
             Setting(settings, "pc_controls") != "0" || Setting(settings, "widescreen") != "0") {
             try {
                 const fs::path menus = PrepareMenuAssets(merged, out / "eboot.elf", data / "engine-assets",
-                                                         out / "bb-engine-assets.exe", is_on("rebirth"));
+                                                         out / "bb-engine-assets.exe", is_on("rebirth"),
+                                                         PlateTitle(settings, "plate_host_title"),
+                                                         PlateTitle(settings, "plate_guest_title"));
                 SetEnv("BB_PC_MENU_ASSETS", Utf8(menus));
                 Log("Engine: native PC menus prepared locally: %s", Utf8(menus).c_str());
                 if (is_on("rebirth"))
@@ -493,6 +547,14 @@ int Main(std::vector<std::wstring> arguments) {
     if (live == "1") {
         Log("Output %s: live resolution changes (live_resolution=0: startup patch)", size_text(scaled->second).c_str());
     } else if (scaled) {
+        std::string early = Env("BB_UPSCALE_EARLY", "");
+        if (early.empty()) early = SettingValue(config, "upscale_before_post").value_or("0");
+        if (early == "1" && scaled->second.w % 4 == 0 && scaled->second.h % 4 == 0) {
+            scaled->first = scaled->second;
+            SetEnv("BB_UPSCALE_EARLY", "1");
+        } else {
+            UnsetEnv("BB_UPSCALE_EARLY");
+        }
         SetEnv("BB_RENDER_RES", size_text(scaled->first));
         SetEnv("BB_OUTPUT_RES", size_text(scaled->second));
         SetEnv("BB_AUTO_RENDER_RES", "1");

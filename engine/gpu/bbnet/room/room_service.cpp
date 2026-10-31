@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "room_service.h"
+#include "room_host.h"
 
+#include <random>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -39,6 +41,7 @@ inline void CloseSocket(SocketHandle s) { close(s); }
 #include <httplib.h>
 #include <openssl/evp.h>
 
+#include "room_announce.h"
 #include "room_link.h"
 
 namespace BbRoom {
@@ -47,16 +50,32 @@ namespace {
 using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 
-enum : std::uint8_t { kRequest = 1, kReply = 2, kEvent = 3, kDatagram = 4, kBatch = 5, kVitals = 6, kTravel = 7, kProgress = 8, kDungeon = 9, kChalices = 10, kPortrait = 11, kBundle = 12 };
+enum : std::uint8_t { kRequest = 1, kReply = 2, kEvent = 3, kDatagram = 4, kBatch = 5, kVitals = 6, kTravel = 7, kProgress = 8, kDungeon = 9, kChalices = 10, kPortrait = 11, kBundle = 12, kBring = 13, kVoice = 14, kBossLot = 15, kBossTrophy = 16, kPiece = 17, kPartyCall = 18, kTravelFlags = 19, kPing = 20, kPong = 21, kWarpAsk = 22, kWarpAnswer = 23, kLampAsk = 24, kLampAnswer = 25 };
 constexpr std::size_t kVitalsFixed = 1 + 1 + 4 * 4 + 2 + 3 * 4 + 4;
 constexpr std::size_t kBatchBytes = 16000;
 constexpr std::size_t kBundleBytes = 60000;
-constexpr auto kBundleWindow = std::chrono::milliseconds(25);
 constexpr std::size_t kLargestPortrait = 128 * 1024;
+constexpr std::size_t kPieceBytes = 1200;
+constexpr std::size_t kPieceHead = 4;
+constexpr std::size_t kMostVoiceBacklog = 2048;
+constexpr std::size_t kLongestPingName = 32;
 
 std::string Env(const char* name) {
     const char* v = std::getenv(name);
     return v ? v : "";
+}
+
+bool DirectRoom() {
+    static const bool direct = Env("BB_ROOM_SERVER").rfind("ws://", 0) == 0;
+    return direct;
+}
+
+std::chrono::milliseconds BundleWindow() {
+    static const std::chrono::milliseconds window = [] {
+        const std::string set = Env("BB_ROOM_BUNDLE_MS");
+        return std::chrono::milliseconds(set.empty() ? (DirectRoom() ? 2 : 8) : std::atoi(set.c_str()));
+    }();
+    return window;
 }
 
 void Log(const char* format, ...) __attribute__((format(printf, 1, 2)));
@@ -97,7 +116,6 @@ struct Member {
 struct MatchRoom {
     std::string session_id;
     int max_members = 4;
-    int next_member = 2;
     std::vector<Member> members;
 };
 
@@ -119,6 +137,12 @@ struct Channel {
     std::map<int, Clock::time_point> ritual;
 };
 
+struct Pieces {
+    std::uint8_t id = 0;
+    std::uint8_t next = 0;
+    std::vector<std::uint8_t> bytes;
+};
+
 struct State {
     Link link;
     std::atomic<int> game_port{0};
@@ -137,6 +161,7 @@ struct State {
 
     std::mutex host_mu;
     std::map<int, std::string> names;
+    std::map<int, Clock::time_point> named_at;
     std::map<std::uint64_t, MatchRoom> rooms;
     std::uint64_t next_room = 1;
     std::map<int, Sign> signs;
@@ -148,13 +173,33 @@ struct State {
 
     std::mutex vitals_mu;
     std::map<int, std::pair<Vitals, Clock::time_point>> vitals;
+    Clock::time_point bring_at{};
+    std::deque<std::pair<int, std::vector<std::uint8_t>>> voice;
+    Link voice_link;
+    LocalRoom local_room;
+    std::mutex voice_mu;
+    bool voice_on = false;
+    std::thread voice_thread;
+    std::atomic<bool> voice_run{false};
     std::uint32_t travel = 0;
     Clock::time_point travel_at;
+    std::vector<std::uint8_t> travel_flags;
     std::vector<std::uint32_t> progress;
+    std::vector<std::int32_t> boss_lots;
+    std::vector<std::int32_t> boss_trophies;
+    std::vector<std::pair<int, PartyCall>> party_calls;
     std::vector<Dungeon> dungeons;
     std::vector<std::uint32_t> chalices;
     bool chalices_new = false;
     std::map<int, std::vector<std::uint8_t>> portraits;
+    std::map<int, Pieces> pieces;
+    std::uint8_t next_pieces = 0;
+    std::mutex announce_mu;
+    AnnouncementQueue announcements;
+    std::mutex status_mu;
+    PartyStatus status;
+    std::atomic<bool> warp_requests{true};
+    Clock::time_point ping_at{};
 };
 
 State& S() {
@@ -214,8 +259,96 @@ void Localize(Json& value) {
     if (value.contains("Members")) Localize(value["Members"]);
 }
 
+enum class Stage { None, Looking, Found, Calling, Waiting, Invited, Failed, HostOnly, Home, Arrived };
+
+struct Notice {
+    std::mutex mu;
+    Stage stage = Stage::None;
+    std::string who;
+    int count = 0;
+    Clock::time_point since, seen;
+};
+
+Notice& N() {
+    static Notice n;
+    return n;
+}
+
+std::string NameOf(int slot) {
+    std::lock_guard lock(S().vitals_mu);
+    const auto it = S().vitals.find(slot);
+    return it == S().vitals.end() || it->second.first.name.empty() ? std::string("a hunter") : it->second.first.name;
+}
+
+void Note(Stage stage, const std::string& who = {}, int count = 0) {
+    Notice& n = N();
+    std::lock_guard lock(n.mu);
+    const auto now = Clock::now();
+    if (n.stage != stage || n.who != who) n.since = now;
+    n.stage = stage;
+    n.who = who;
+    n.count = count;
+    n.seen = now;
+}
+
+void AddPartyLine(PartyLineKind kind, const std::string& name) {
+    std::lock_guard lock(S().status_mu);
+    S().status.AddLine(kind, name, Clock::now());
+}
+
+std::string MemberName(const Json& ev) {
+    const std::string name = PlainName(CleanAnnouncement(StrOf(ev, "OnlineId")));
+    return name.empty() ? NameOf(static_cast<int>(IntOf(ev, "Slot"))) : name;
+}
+
+void NoteEvent(const Json& ev) {
+    const std::string name = StrOf(ev, "Name");
+    if (name == "guest_invite") {
+        const std::string host = StrOf(ev, "HostOnlineId");
+        Note(Stage::Invited, host.empty() ? std::string("the host") : host);
+    } else if (name == "room_member_joined") {
+        AddPartyLine(PartyLineKind::JoinedWorld, MemberName(ev));
+    } else if (name == "room_member_left") {
+        AddPartyLine(StrOf(ev, "Reason") == "kicked" && !ev.contains("ByChoice") ? PartyLineKind::Kicked : PartyLineKind::Left, MemberName(ev));
+    } else if (name == "room_member_kicked" || name == "room_closed") {
+        Note(Stage::Home);
+    }
+}
+
+void NoteSummon(const std::string& api, const Json& body, const Json& reply, bool ok) {
+    if (!ok) {
+        if (api == "request") Note(Stage::Failed);
+        return;
+    }
+    if (api == "create") {
+        Note(Stage::Waiting);
+    } else if (api == "delete") {
+        Notice& n = N();
+        std::lock_guard lock(n.mu);
+        if (n.stage == Stage::Waiting) n.stage = Stage::None;
+    } else if (reply.contains("LanternHostOnly")) {
+        Note(Stage::HostOnly);
+    } else if (api == "get") {
+        const auto list = reply.contains("SummonDataList") && reply["SummonDataList"].is_array() ? reply["SummonDataList"]
+                                                                                              : Json::array();
+        if (list.empty()) {
+            Notice& n = N();
+            std::unique_lock lock(n.mu);
+            const bool busy = n.stage == Stage::Calling && Clock::now() - n.since < std::chrono::seconds(20);
+            lock.unlock();
+            if (!busy) Note(Stage::Looking);
+        } else {
+            const std::string first = NameOf(static_cast<int>(IntOf(list[0], "UserId") - 1000));
+            Note(Stage::Found, first, static_cast<int>(list.size()));
+        }
+    } else if (api == "request") {
+        Note(Stage::Calling, NameOf(static_cast<int>(IntOf(body, "TargetUserId") - 1000)));
+    }
+}
+
 void Deliver(int slot, Json event) {
     if (slot == S().own_slot.load()) {
+        NoteEvent(event);
         Localize(event);
         {
             std::lock_guard lock(S().mu);
@@ -236,7 +369,7 @@ Json Record(const MatchRoom& room, const Member& m, std::uint64_t room_id) {
     return r;
 }
 
-void LeaveLocked(std::uint64_t room_id, int slot, const char* reason) {
+void LeaveLocked(std::uint64_t room_id, int slot, const char* reason, bool by_choice = false) {
     const auto it = S().rooms.find(room_id);
     if (it == S().rooms.end()) return;
     MatchRoom& room = it->second;
@@ -254,7 +387,29 @@ void LeaveLocked(std::uint64_t room_id, int slot, const char* reason) {
     Json ev = Record(room, gone, room_id);
     ev["Name"] = "room_member_left";
     ev["Reason"] = reason;
+    if (by_choice) ev["ByChoice"] = true;
     for (const Member& other : room.members) Deliver(other.slot, ev);
+}
+
+bool KickLocked(int target, bool by_choice) {
+    const int own = S().own_slot.load();
+    for (auto& [id, room] : S().rooms) {
+        const bool mine = std::any_of(room.members.begin(), room.members.end(),
+                                      [&](const Member& m) { return m.slot == own && m.member_id == 1; });
+        if (!mine) continue;
+        for (const Member& m : room.members) {
+            if (m.slot != target || m.slot == own) continue;
+            Deliver(m.slot, {{"Name", "room_member_kicked"}, {"RoomId", static_cast<long long>(id)},
+                             {"MemberId", m.member_id}, {"OptData", ""}});
+            LeaveLocked(id, target, "kicked", by_choice);
+            {
+                std::lock_guard status_lock(S().status_mu);
+                S().status.ClearAsk(target);
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 Json HandleSession(int slot, const std::string& path, const Json& body) {
@@ -263,20 +418,32 @@ Json HandleSession(int slot, const std::string& path, const Json& body) {
         const std::string name = StrOf(body, "OnlineId");
         if (!name.empty() && S().names[slot] != name) {
             S().names[slot] = name;
+            S().named_at[slot] = Clock::now();
             Log("slot %d is %s", slot, name.c_str());
         }
         return {{"ResKind", 0}};
     }
     if (path == "/np/signaling/resolve") {
         const std::string id = StrOf(body, "OnlineId");
+        int best = 0;
+        Clock::time_point best_at{};
         for (const auto& [s, name] : S().names) {
-            if (name == id) return {{"ResKind", 0}, {"Slot", s}};
+            if (name != id) continue;
+            const auto at = S().named_at.count(s) ? S().named_at[s] : Clock::time_point{};
+            if (!best || at > best_at) {
+                best = s;
+                best_at = at;
+            }
         }
+        if (best) return {{"ResKind", 0}, {"Slot", best}};
         return {{"ResKind", 1}};
     }
     if (path == "/mp/matching2/create_room") {
         const std::string name = StrOf(body, "OnlineId");
-        if (!name.empty()) S().names[slot] = name;
+        if (!name.empty() && S().names[slot] != name) {
+            S().names[slot] = name;
+            S().named_at[slot] = Clock::now();
+        }
         for (auto it = S().rooms.begin(); it != S().rooms.end();) {
             const bool owned = std::any_of(it->second.members.begin(), it->second.members.end(),
                                            [&](const Member& m) { return m.slot == slot && m.member_id == 1; });
@@ -299,7 +466,10 @@ Json HandleSession(int slot, const std::string& path, const Json& body) {
     }
     if (path == "/mp/matching2/join_room") {
         const std::string name = StrOf(body, "OnlineId");
-        if (!name.empty()) S().names[slot] = name;
+        if (!name.empty() && S().names[slot] != name) {
+            S().names[slot] = name;
+            S().named_at[slot] = Clock::now();
+        }
         const auto id = static_cast<std::uint64_t>(IntOf(body, "RoomId"));
         const auto it = S().rooms.find(id);
         if (it == S().rooms.end()) return {{"ResKind", 1}, {"Message", "no such room"}};
@@ -313,7 +483,12 @@ Json HandleSession(int slot, const std::string& path, const Json& body) {
             }
         }
         if (static_cast<int>(room.members.size()) >= room.max_members) return {{"ResKind", 1}, {"Message", "room full"}};
-        const Member joined{room.next_member++, slot};
+        int free_member = 2;
+        while (std::any_of(room.members.begin(), room.members.end(),
+                           [&](const Member& m) { return m.member_id == free_member; })) {
+            ++free_member;
+        }
+        const Member joined{free_member, slot};
         room.members.push_back(joined);
         Json members = Json::array();
         for (const Member& x : room.members) members.push_back(Record(room, x, id));
@@ -342,6 +517,10 @@ Json HandleSession(int slot, const std::string& path, const Json& body) {
             }
         }
         return {{"ResKind", 0}, {"InRoom", 0}};
+    }
+    if (path == "/lantern/leave_party") {
+        KickLocked(slot, true);
+        return {{"ResKind", 0}};
     }
     if (path == "/mp/matching2/kick_member") {
         const int target = static_cast<int>(IntOf(body, "MemberId"));
@@ -376,6 +555,7 @@ void ForgetSlotLocked(int slot) {
         }
         S().names.erase(name);
     }
+    S().named_at.erase(slot);
 }
 
 bool B64Size(const std::string& text, std::size_t want) {
@@ -395,7 +575,14 @@ Json HandleSummon(int slot, const std::string& api, const Json& body) {
         const std::string data = StrOf(body, "SummonData");
         if (!B64Size(data, 0xE0)) return {{"ResKind", 0}};
         S().signs[slot] = {data, IntOf(body, "SummonType"), IntOf(body, "CharaId", slot)};
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 20) Log("slot %d put up a summon sign (type %lld)", slot, IntOf(body, "SummonType"));
         return {{"ResKind", 0}};
+    }
+    if ((api == "get" || api == "request") && slot != S().own_slot.load()) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 8) Log("slot %d rang a Beckoning Bell, but only the room's host summons", slot);
+        return {{"ResKind", 0}, {"SummonDataList", Json::array()}, {"LanternHostOnly", true}};
     }
     if (api == "get") {
         std::set<long long> types;
@@ -403,6 +590,8 @@ Json HandleSummon(int slot, const std::string& api, const Json& body) {
             for (const auto& t : body["SummonTypeList"]) types.insert(IntOf(t, "SummonType", -1));
         }
         Json list = Json::array();
+        static std::atomic<int> searched{0};
+        if (searched.fetch_add(1) < 20) Log("the host searches the summon board: %zu sign(s) up", S().signs.size());
         for (const auto& [s, sign] : S().signs) {
             if (s == slot) continue;
             if (!types.empty() && !types.count(sign.type)) continue;
@@ -413,7 +602,7 @@ Json HandleSummon(int slot, const std::string& api, const Json& body) {
     }
     if (api == "request") {
         const int target = static_cast<int>(IntOf(body, "TargetUserId") - 1000);
-        if (target >= 1 && target <= 5 && target != slot) {
+        if (target >= 1 && target <= 5 && target != slot && S().signs.count(target)) {
             Json ev = {{"Name", "guest_invite"}, {"HostSlot", slot}};
             const auto name = S().names.find(slot);
             ev["HostOnlineId"] = name == S().names.end() ? "" : name->second;
@@ -644,9 +833,10 @@ bool Rpc(const Json& request, Json& reply, std::string& error, int timeout_ms) {
         Localize(reply);
         return true;
     }
-    const int host = HostSlotWait(std::min(timeout_ms, 10000));
+    const bool start = StrOf(request, "p") == "/mp/matching2/context_start" && Env("BB_ROOM_START_WAITS_HOST") != "1";
+    const int host = HostSlotWait(start ? 0 : std::min(timeout_ms, 10000));
     if (!host) {
-        error = "no host in the room";
+        error = start ? "no host in the room yet; this hunter is introduced when the host comes" : "no host in the room";
         return false;
     }
     std::uint32_t id;
@@ -734,21 +924,17 @@ void BridgeToGame(int slot, const std::uint8_t* data, std::size_t size) {
 }
 
 void SendBundle(std::map<int, std::vector<std::uint8_t>>& pending) {
-    std::vector<std::uint8_t> frame{kBundle};
-    const auto flush = [&] {
-        if (frame.size() > 1) S().link.Send(0, frame.data(), frame.size());
-        frame.assign(1, kBundle);
-    };
+    std::vector<std::uint8_t> frame;
     for (auto& [slot, bytes] : pending) {
         if (bytes.empty()) continue;
-        if (frame.size() + 5 + bytes.size() > kBundleBytes) flush();
+        frame.assign(1, kBundle);
         frame.push_back(static_cast<std::uint8_t>(slot));
         const auto n = static_cast<std::uint32_t>(bytes.size());
         frame.insert(frame.end(), reinterpret_cast<const std::uint8_t*>(&n), reinterpret_cast<const std::uint8_t*>(&n) + 4);
         frame.insert(frame.end(), bytes.begin(), bytes.end());
+        S().link.SendGame(slot, frame.data(), frame.size());
         bytes.clear();
     }
-    flush();
 }
 
 void BridgeLoop() {
@@ -796,13 +982,18 @@ void BridgeLoop() {
                         held += 2 + static_cast<std::size_t>(n);
                     }
                 }
-                if (until == Clock::time_point{} && held) until = Clock::now() + kBundleWindow;
+                if (until == Clock::time_point{} && held) until = Clock::now() + BundleWindow();
             }
             if (until == Clock::time_point{}) break;
             if (Clock::now() >= until || held >= kBundleBytes) break;
         }
         if (held) SendBundle(pending);
     }
+}
+
+std::int64_t SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 void OnFrame(int sender, const std::vector<std::uint8_t>& data) {
@@ -852,6 +1043,12 @@ void OnFrame(int sender, const std::vector<std::uint8_t>& data) {
         S().travel_at = Clock::now();
         return;
     }
+    if (kind == kTravelFlags) {
+        if (sender != S().link.HostSlot() || data.size() < 2 || data.size() > 1 + 4096) return;
+        std::lock_guard lock(S().vitals_mu);
+        S().travel_flags.assign(data.begin() + 1, data.end());
+        return;
+    }
     if (kind == kProgress) {
         if (data.size() < 1 || (data.size() - 1) % 4 || sender != S().link.HostSlot()) return;
         std::lock_guard lock(S().vitals_mu);
@@ -860,6 +1057,28 @@ void OnFrame(int sender, const std::vector<std::uint8_t>& data) {
             std::memcpy(&id, data.data() + at, 4);
             S().progress.push_back(id);
         }
+        return;
+    }
+    if (kind == kBossLot) {
+        if (data.size() != 5 || sender != S().link.HostSlot()) return;
+        std::int32_t lot = 0;
+        std::memcpy(&lot, data.data() + 1, 4);
+        std::lock_guard lock(S().vitals_mu);
+        if (S().boss_lots.size() < 64) S().boss_lots.push_back(lot);
+        return;
+    }
+    if (kind == kBossTrophy) {
+        if (data.size() != 5 || sender != S().link.HostSlot()) return;
+        std::int32_t trophy = 0;
+        std::memcpy(&trophy, data.data() + 1, 4);
+        std::lock_guard lock(S().vitals_mu);
+        if (S().boss_trophies.size() < 64) S().boss_trophies.push_back(trophy);
+        return;
+    }
+    if (kind == kPartyCall) {
+        if (data.size() != 2) return;
+        std::lock_guard lock(S().vitals_mu);
+        if (S().party_calls.size() < 16) S().party_calls.emplace_back(sender, PartyCall(data[1]));
         return;
     }
     if (kind == kDungeon) {
@@ -872,6 +1091,110 @@ void OnFrame(int sender, const std::vector<std::uint8_t>& data) {
         if (!d.flags.empty()) std::memcpy(d.flags.data(), data.data() + fixed, 4 * d.flags.size());
         std::lock_guard lock(S().vitals_mu);
         if (S().dungeons.size() < 8) S().dungeons.push_back(std::move(d));
+        return;
+    }
+    if (kind == kVoice) {
+        if (data.size() < 4 || data.size() > 1200) return;
+        std::lock_guard lock(S().vitals_mu);
+        if (S().voice.size() >= 48) S().voice.pop_front();
+        S().voice.emplace_back(sender, std::vector<std::uint8_t>(data.begin() + 1, data.end()));
+        return;
+    }
+    if (kind == kBring) {
+        if (data.size() != 1 || sender != S().link.HostSlot()) return;
+        {
+            std::lock_guard lock(S().vitals_mu);
+            S().bring_at = Clock::now();
+        }
+        std::lock_guard lock(S().status_mu);
+        S().status.GuestBrought();
+        return;
+    }
+    if (kind == kPing) {
+        if (data.size() < 5 || data.size() > 5 + kLongestPingName) return;
+        {
+            std::lock_guard lock(S().status_mu);
+            S().status.Pinged(sender);
+            S().status.Named(sender, std::string(data.begin() + 5, data.end()), Clock::now());
+        }
+        std::uint8_t pong[5] = {kPong};
+        std::memcpy(pong + 1, data.data() + 1, 4);
+        S().link.Send(sender, pong, sizeof pong);
+        return;
+    }
+    if (kind == kPong) {
+        if (data.size() != 5) return;
+        std::uint32_t stamp = 0;
+        std::memcpy(&stamp, data.data() + 1, 4);
+        const std::uint32_t ms = static_cast<std::uint32_t>(SteadyMs()) - stamp;
+        std::lock_guard lock(S().status_mu);
+        S().status.Pinged(sender);
+        S().status.Rtt(sender, static_cast<int>(std::min<std::uint32_t>(ms, 0x7fffffff)));
+        return;
+    }
+    if (kind == kWarpAsk) {
+        if (data.size() != 1 || !S().host) return;
+        bool member = false;
+        for (const auto& [slot, name] : PartyMembers()) member = member || slot == sender;
+        const bool take = member && S().warp_requests.load();
+        if (take) {
+            std::lock_guard lock(S().status_mu);
+            if (S().status.Ask(sender, Clock::now())) Log("slot %d asks to be brought to the host", sender);
+        }
+        const std::uint8_t answer[2] = {kWarpAnswer, take ? std::uint8_t(kWarpGot) : std::uint8_t(kWarpRefused)};
+        S().link.Send(sender, answer, sizeof answer);
+        return;
+    }
+    if (kind == kWarpAnswer) {
+        if (data.size() != 2 || sender != S().link.HostSlot()) return;
+        std::lock_guard lock(S().status_mu);
+        S().status.GuestAnswered(data[1], Clock::now());
+        return;
+    }
+    if (kind == kLampAsk) {
+        if (data.size() != 5 || !S().host) return;
+        bool member = false;
+        for (const auto& [slot, name] : PartyMembers()) member = member || slot == sender;
+        std::uint32_t lamp = 0;
+        std::memcpy(&lamp, data.data() + 1, 4);
+        bool take = member && S().warp_requests.load();
+        if (take) {
+            std::lock_guard lock(S().status_mu);
+            take = S().status.LampAsk(sender, lamp, Clock::now());
+        }
+        if (take) Log("slot %d asks the party to travel to lamp %u", sender, lamp);
+        const std::uint8_t answer[2] = {kLampAnswer, take ? std::uint8_t(kLampGot) : std::uint8_t(kLampRefused)};
+        S().link.Send(sender, answer, sizeof answer);
+        return;
+    }
+    if (kind == kLampAnswer) {
+        if (data.size() != 2 || sender != S().link.HostSlot()) return;
+        std::lock_guard lock(S().status_mu);
+        S().status.GuestLampAnswered(data[1], Clock::now());
+        return;
+    }
+    if (kind == kPiece) {
+        if (data.size() <= kPieceHead) return;
+        const std::uint8_t id = data[1], index = data[2], count = data[3];
+        std::vector<std::uint8_t> whole;
+        {
+            std::lock_guard lock(S().vitals_mu);
+            Pieces& p = S().pieces[sender];
+            if (index == 0) {
+                p = Pieces{};
+                p.id = id;
+            }
+            if (p.id != id || p.next != index || p.bytes.size() + data.size() > kLargestPortrait) {
+                S().pieces.erase(sender);
+                return;
+            }
+            p.bytes.insert(p.bytes.end(), data.begin() + kPieceHead, data.end());
+            ++p.next;
+            if (p.next < count) return;
+            whole = std::move(p.bytes);
+            S().pieces.erase(sender);
+        }
+        if (!whole.empty() && whole[0] == kPortrait) OnFrame(sender, whole);
         return;
     }
     if (kind == kPortrait) {
@@ -911,6 +1234,11 @@ void OnFrame(int sender, const std::vector<std::uint8_t>& data) {
         std::memcpy(v.pos, data.data() + at, sizeof v.pos);
         at += sizeof v.pos;
         std::memcpy(&v.map, data.data() + at, 4);
+        {
+            std::lock_guard lock(S().status_mu);
+            S().status.Named(sender, v.name, Clock::now());
+            S().status.Vitals(sender, v.hp, v.hp_max, v.map, Clock::now());
+        }
         std::lock_guard lock(S().vitals_mu);
         S().vitals[sender] = {std::move(v), Clock::now()};
         return;
@@ -938,6 +1266,7 @@ void OnFrame(int sender, const std::vector<std::uint8_t>& data) {
         if (sender != S().link.HostSlot()) return;
         Json value = Json::parse(data.begin() + 1, data.end(), nullptr, false);
         if (!value.is_object()) return;
+        NoteEvent(value);
         Localize(value);
         {
             std::lock_guard lock(S().mu);
@@ -946,6 +1275,25 @@ void OnFrame(int sender, const std::vector<std::uint8_t>& data) {
         }
         S().cv.notify_all();
     }
+}
+
+std::atomic<std::int64_t> g_connected_at_ms{0};
+
+void StatusTick() {
+    const auto now = Clock::now();
+    {
+        std::lock_guard lock(S().status_mu);
+        S().status.Tick(now);
+    }
+    if (!S().link.Connected() || now - S().ping_at < kPingEvery) return;
+    S().ping_at = now;
+    const auto stamp = static_cast<std::uint32_t>(SteadyMs());
+    std::vector<std::uint8_t> frame(5);
+    frame[0] = kPing;
+    std::memcpy(frame.data() + 1, &stamp, 4);
+    const std::string name = S().player.substr(0, kLongestPingName);
+    frame.insert(frame.end(), name.begin(), name.end());
+    S().link.Send(0, frame.data(), frame.size());
 }
 
 void LinkLoop() {
@@ -958,6 +1306,11 @@ void LinkLoop() {
                 if (S().own_slot.load() && S().own_slot.load() != e.slot)
                     Log("came back as slot %d (was %d)", e.slot, S().own_slot.load());
                 S().own_slot = e.slot;
+                if (!g_connected_at_ms.load()) g_connected_at_ms = SteadyMs();
+                {
+                    std::lock_guard lock(S().status_mu);
+                    S().status.OwnConnected(Clock::now());
+                }
                 Log("in the room as slot %d%s", e.slot, S().host ? " (host)" : "");
                 break;
             case Event::Kind::Joined:
@@ -969,6 +1322,10 @@ void LinkLoop() {
                 {
                     std::lock_guard lock(S().vitals_mu);
                     S().vitals.erase(e.slot);
+                }
+                {
+                    std::lock_guard lock(S().status_mu);
+                    S().status.Left(e.slot, Clock::now());
                 }
                 if (S().host) {
                     std::lock_guard lock(S().host_mu);
@@ -989,12 +1346,24 @@ void LinkLoop() {
                              Json{{"p", "/mp/matching2/context_start"}, {"b", {{"OnlineId", S().player}}}}, 0, true);
                 break;
             case Event::Kind::Data:
+                {
+                    std::lock_guard lock(S().status_mu);
+                    S().status.Heard(e.slot, Clock::now());
+                }
                 OnFrame(e.slot, e.data);
                 break;
             case Event::Kind::Disconnected:
                 Log("lost the room connection; reconnecting");
+                {
+                    std::lock_guard lock(S().status_mu);
+                    S().status.OwnLost(Clock::now());
+                }
                 break;
             case Event::Kind::GaveUp:
+                {
+                    std::lock_guard lock(S().status_mu);
+                    S().status.OwnGaveUp(Clock::now());
+                }
                 Log("the room could not be reached for 2 minutes: seamless co-op is off until the next start");
                 break;
             case Event::Kind::Refused:
@@ -1002,8 +1371,19 @@ void LinkLoop() {
                     "room open (one room per player); retrying",
                     S().link.LastError().empty() ? "refused" : S().link.LastError().c_str());
                 break;
+            case Event::Kind::Visitor:
+                AddPartyLine(PartyLineKind::Visitor, {});
+                break;
+            case Event::Kind::Announcement:
+                if (AnnouncementServer(Env("BB_ROOM_SERVER"))) {
+                    const std::string words(e.data.begin(), e.data.end());
+                    std::lock_guard lock(S().announce_mu);
+                    if (S().announcements.Offer(e.id, words, Clock::now())) Log("server announcement: %s", CleanAnnouncement(words).c_str());
+                }
+                break;
             }
         }
+        StatusTick();
     }
 }
 
@@ -1037,7 +1417,9 @@ std::string GameApiAnswer(const std::string& path, const Json& body) {
     if (path.rfind("/summon_messenger/", 0) == 0 || path.rfind("/channel/", 0) == 0) {
         Json reply;
         std::string error;
-        if (!Rpc({{"p", path}, {"b", body}}, reply, error, 8000)) return "";
+        const bool ok = Rpc({{"p", path}, {"b", body}}, reply, error, 8000);
+        if (path.rfind("/summon_messenger/", 0) == 0) NoteSummon(path.substr(18), body, reply, ok);
+        if (!ok) return "";
         return reply.dump();
     }
     Json reply = {{"ResKind", 0}};
@@ -1138,6 +1520,16 @@ bool Active() {
     return on;
 }
 
+std::int64_t ConnectedForMs() {
+    const std::int64_t at = g_connected_at_ms.load();
+    return at ? SteadyMs() - at : -1;
+}
+
+bool SponsoredRelay() {
+    static const bool on = Env("BB_ROOM_SERVER").find("185-244-28-175.sslip.io") != std::string::npos;
+    return on;
+}
+
 bool IsHost() {
     return Env("BB_ROOM_HOST") == "1";
 }
@@ -1175,37 +1567,81 @@ std::vector<Vitals> Party(int max_age_ms) {
     return out;
 }
 
-void SendTravel(std::uint32_t lamp) {
+void SendTravel(std::uint32_t lamp, const std::vector<std::uint8_t>& world_flags) {
     if (!S().started.load() || !S().link.Connected()) return;
+    if (!world_flags.empty()) {
+        std::vector<std::uint8_t> flags_frame(1 + world_flags.size());
+        flags_frame[0] = kTravelFlags;
+        std::memcpy(flags_frame.data() + 1, world_flags.data(), world_flags.size());
+        S().link.Send(0, flags_frame.data(), flags_frame.size());
+    }
     std::uint8_t frame[5] = {kTravel};
     std::memcpy(frame + 1, &lamp, 4);
     S().link.Send(0, frame, sizeof frame);
     Log("travelling to lamp %u: the party follows", lamp);
 }
 
-bool TakeTravel(std::uint32_t& lamp) {
+bool TakeTravel(std::uint32_t& lamp, std::vector<std::uint8_t>* world_flags) {
     std::lock_guard lock(S().vitals_mu);
     if (!S().travel) return false;
-    if (Clock::now() - S().travel_at > std::chrono::seconds(10)) {
+    std::vector<std::uint8_t> flags;
+    flags.swap(S().travel_flags);
+    if (Clock::now() - S().travel_at > std::chrono::seconds(120)) {
         S().travel = 0;
         return false;
     }
     lamp = S().travel;
     S().travel = 0;
+    if (world_flags) *world_flags = std::move(flags);
     return true;
 }
 
-void SendProgress(const std::vector<std::uint32_t>& flags) {
+void SendProgress(const std::vector<std::uint32_t>& flags, int target) {
     if (flags.empty() || !S().started.load() || !S().link.Connected()) return;
     std::vector<std::uint8_t> frame(1 + 4 * flags.size());
     frame[0] = kProgress;
     std::memcpy(frame.data() + 1, flags.data(), 4 * flags.size());
-    S().link.Send(0, frame.data(), frame.size());
+    S().link.Send(target, frame.data(), frame.size());
 }
 
 std::vector<std::uint32_t> TakeProgress() {
     std::lock_guard lock(S().vitals_mu);
     return std::exchange(S().progress, {});
+}
+
+void SendBossLot(std::int32_t lot, int target) {
+    if (!S().started.load() || !S().link.Connected()) return;
+    std::uint8_t frame[5] = {kBossLot};
+    std::memcpy(frame + 1, &lot, 4);
+    S().link.Send(target, frame, sizeof frame);
+}
+
+void SendBossTrophy(std::int32_t trophy, int target) {
+    if (!S().started.load() || !S().link.Connected()) return;
+    std::uint8_t frame[5] = {kBossTrophy};
+    std::memcpy(frame + 1, &trophy, 4);
+    S().link.Send(target, frame, sizeof frame);
+}
+
+void SendPartyCall(PartyCall call, int target) {
+    if (!S().started.load() || !S().link.Connected()) return;
+    const std::uint8_t frame[2] = {kPartyCall, std::uint8_t(call)};
+    S().link.Send(target, frame, sizeof frame);
+}
+
+std::vector<std::pair<int, PartyCall>> TakePartyCalls() {
+    std::lock_guard lock(S().vitals_mu);
+    return std::exchange(S().party_calls, {});
+}
+
+std::vector<std::int32_t> TakeBossTrophies() {
+    std::lock_guard lock(S().vitals_mu);
+    return std::exchange(S().boss_trophies, {});
+}
+
+std::vector<std::int32_t> TakeBossLots() {
+    std::lock_guard lock(S().vitals_mu);
+    return std::exchange(S().boss_lots, {});
 }
 
 void PutDungeonForm(std::uint64_t channel, const std::vector<std::uint8_t>& data) {
@@ -1230,14 +1666,14 @@ void PutDungeonForm(std::uint64_t channel, const std::vector<std::uint8_t>& data
     Log("dungeon %llu: its layout is on the room's board", static_cast<unsigned long long>(channel));
 }
 
-void SendDungeon(const Dungeon& d) {
+void SendDungeon(const Dungeon& d, int target) {
     if (!S().started.load() || !S().link.Connected()) return;
     std::vector<std::uint8_t> frame(1 + 8 + 4 * 43 + 4 * d.flags.size());
     frame[0] = kDungeon;
     std::memcpy(frame.data() + 1, &d.channel, 8);
     std::memcpy(frame.data() + 9, d.record.data(), 4 * 43);
     if (!d.flags.empty()) std::memcpy(frame.data() + 9 + 4 * 43, d.flags.data(), 4 * d.flags.size());
-    S().link.Send(0, frame.data(), frame.size());
+    S().link.Send(target, frame.data(), frame.size());
 }
 
 bool TakeDungeon(Dungeon& out) {
@@ -1269,7 +1705,17 @@ void SendPortrait(const std::vector<std::uint8_t>& packed) {
     std::vector<std::uint8_t> frame(1 + packed.size());
     frame[0] = kPortrait;
     std::memcpy(frame.data() + 1, packed.data(), packed.size());
-    S().link.Send(0, frame.data(), frame.size());
+    const std::size_t count = (frame.size() + kPieceBytes - 1) / kPieceBytes;
+    if (count > 255) return;
+    const std::uint8_t id = ++S().next_pieces;
+    std::vector<std::uint8_t> piece;
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::size_t at = i * kPieceBytes;
+        const std::size_t size = std::min(kPieceBytes, frame.size() - at);
+        piece.assign({kPiece, id, static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(count)});
+        piece.insert(piece.end(), frame.begin() + static_cast<std::ptrdiff_t>(at), frame.begin() + static_cast<std::ptrdiff_t>(at + size));
+        if (!S().link.SendPaced(0, piece.data(), piece.size())) return;
+    }
 }
 
 std::vector<std::pair<int, std::vector<std::uint8_t>>> TakePortraits() {
@@ -1287,6 +1733,26 @@ std::string PlayerName() {
     return Env("BB_ROOM_PLAYER").substr(0, 16);
 }
 
+std::string NetworkId() {
+    static const std::string id = [] {
+        const std::string name = PlayerName();
+        if (name.empty()) return name;
+        char tag[8];
+        std::snprintf(tag, sizeof tag, "-%04x", std::random_device{}() & 0xffffu);
+        return name.substr(0, 16 - 5) + tag;
+    }();
+    return id;
+}
+
+std::string PlainName(const std::string& network_id) {
+    const std::size_t n = network_id.size();
+    if (n < 6 || network_id[n - 5] != '-') return network_id;
+    for (std::size_t i = n - 4; i < n; ++i) {
+        if (!std::isxdigit(static_cast<unsigned char>(network_id[i]))) return network_id;
+    }
+    return network_id.substr(0, n - 5);
+}
+
 void Start(int game_p2p_port) {
     if (S().started.exchange(true)) return;
     if (!S().game_port) S().game_port = game_p2p_port;
@@ -1295,11 +1761,20 @@ void Start(int game_p2p_port) {
     S().http_port = std::atoi(Env("BB_ROOM_HTTP_PORT").c_str());
     if (S().http_port <= 0 || S().http_port > 65535) S().http_port = game_p2p_port + 1;
     S().link.SetHost(S().host);
+    S().link.SetVisitor(!S().host && Env("BB_ROOM_VISITOR") == "1");
+    if (const int local = std::atoi(Env("BB_ROOM_LOCAL_PORT").c_str()); S().host && local > 0) {
+        std::string error;
+        if (!S().local_room.Start(local, Derive(Env("BB_ROOM_NAME"), Env("BB_ROOM_PASSWORD")).room_id, error)) {
+            Log("direct room not opened: %s", error.c_str());
+            return;
+        }
+        Log("direct room open on this PC, port %d: guests connect straight to this game, no server", local);
+    }
     if (!S().link.Start(Env("BB_ROOM_SERVER"), Env("BB_ROOM_NAME"), Env("BB_ROOM_PASSWORD"))) {
         Log("no room server or room name: seamless co-op is off");
         return;
     }
-    Log("joining room on %s as %s (%s), game server on 127.0.0.1:%d", Env("BB_ROOM_SERVER").c_str(),
+    Log("joining room on %s as %s (%s), game server on 127.0.0.1:%d", DirectRoom() ? "a direct connection" : Env("BB_ROOM_SERVER").c_str(),
         S().player.c_str(), S().host ? "host" : "guest", S().http_port);
     std::thread(LinkLoop).detach();
     std::thread(BridgeLoop).detach();
@@ -1316,7 +1791,293 @@ bool Call(const std::string& path, const Json& body, Json& reply, std::string& e
         reply = {{"ResKind", 0}};
         return true;
     }
-    return Rpc({{"p", path}, {"b", body}}, reply, error, std::max(timeout_ms, 3000));
+    const bool ok = Rpc({{"p", path}, {"b", body}}, reply, error, std::max(timeout_ms, 3000));
+    if (path == "/mp/matching2/join_room") {
+        const bool joined = ok && IntOf(reply, "ResKind", 1) == 0;
+        Notice& n = N();
+        std::unique_lock lock(n.mu);
+        const std::string who = n.who;
+        lock.unlock();
+        Note(joined ? Stage::Arrived : Stage::Failed, joined ? who : std::string());
+    }
+    return ok;
+}
+
+std::vector<std::pair<int, std::string>> PartyMembers() {
+    std::vector<std::pair<int, std::string>> out;
+    if (!S().host) return out;
+    std::lock_guard lock(S().host_mu);
+    const int own = S().own_slot.load();
+    for (const auto& [id, room] : S().rooms) {
+        const bool mine = std::any_of(room.members.begin(), room.members.end(),
+                                      [&](const Member& m) { return m.slot == own && m.member_id == 1; });
+        if (!mine) continue;
+        for (const Member& m : room.members) {
+            if (m.slot == own) continue;
+            const auto name = S().names.find(m.slot);
+            out.emplace_back(m.slot, name == S().names.end() ? std::string("a hunter") : name->second);
+        }
+    }
+    return out;
+}
+
+bool Kick(int slot) {
+    if (!S().host) return false;
+    std::lock_guard lock(S().host_mu);
+    const bool done = KickLocked(slot, false);
+    if (done) Log("the host sent slot %d home", slot);
+    if (!S().link.IsVisitor(slot)) return done;
+    S().link.SendAway(slot);
+    Log("the host sent the visitor in slot %d away from the room", slot);
+    return true;
+}
+
+bool OpenRoomAllowed() {
+    return IsHost() && AnnouncementServer(Env("BB_ROOM_SERVER"));
+}
+
+void SetOpenRoom(bool on) {
+    S().link.SetOpen(on && OpenRoomAllowed());
+}
+
+bool OpenRoomListed() {
+    return S().link.OpenListed();
+}
+
+bool IsVisitorSlot(int slot) {
+    return S().link.IsVisitor(slot);
+}
+
+bool LeaveParty() {
+    if (S().host || !S().started.load()) return false;
+    Json reply;
+    std::string error;
+    const bool ok = Rpc({{"p", "/lantern/leave_party"}, {"b", Json::object()}}, reply, error, 5000);
+    if (ok) Log("left the host's world from the co-op panel");
+    return ok;
+}
+
+namespace {
+std::atomic<bool> g_sent_home{false};
+}
+
+bool IsDevSlot(int slot) {
+    return S().link.IsDev(slot);
+}
+
+void TakeDownSign() {
+    if (S().host || !S().started.load()) return;
+    std::thread([] {
+        Json reply;
+        std::string error;
+        Rpc({{"p", "/summon_messenger/delete"}, {"b", Json::object()}}, reply, error, 3000);
+    }).detach();
+}
+
+void NoteSentHome() {
+    g_sent_home = true;
+}
+
+bool TakeSentHome() {
+    return g_sent_home.exchange(false);
+}
+
+void VoiceLoop() {
+    while (S().voice_run.load()) {
+        S().voice_link.WaitEvent(200);
+        for (auto& e : S().voice_link.Drain()) {
+            if (e.kind == Event::Kind::Connected) Log("voice: connected to the room's voice channel");
+            if (e.kind != Event::Kind::Data || e.data.size() < 4 || e.data.size() > 1200 || e.data[0] != kVoice) continue;
+            std::lock_guard lock(S().vitals_mu);
+            if (S().voice.size() >= 48) S().voice.pop_front();
+            S().voice.emplace_back(-e.slot, std::vector<std::uint8_t>(e.data.begin() + 1, e.data.end()));
+        }
+    }
+}
+
+void SetVoice(bool on) {
+    std::lock_guard lock(S().voice_mu);
+    if (on == S().voice_on || (on && !S().started.load())) return;
+    S().voice_on = on;
+    if (on) {
+        if (!S().voice_link.Start(Env("BB_ROOM_SERVER"), Env("BB_ROOM_NAME"), Env("BB_ROOM_PASSWORD"), "voice")) {
+            S().voice_on = false;
+            return;
+        }
+        S().voice_run = true;
+        S().voice_thread = std::thread(VoiceLoop);
+        return;
+    }
+    S().voice_run = false;
+    if (S().voice_thread.joinable()) S().voice_thread.join();
+    S().voice_link.Stop();
+    Log("voice: left the room's voice channel");
+}
+
+void SendVoice(const std::vector<std::uint8_t>& packet) {
+    if (packet.empty() || packet.size() > 1100 || !S().voice_link.Connected()) return;
+    std::vector<std::uint8_t> frame(1 + packet.size());
+    frame[0] = kVoice;
+    std::memcpy(frame.data() + 1, packet.data(), packet.size());
+    S().voice_link.SendLossy(0, frame.data(), frame.size(), kMostVoiceBacklog);
+}
+
+std::vector<std::pair<int, std::vector<std::uint8_t>>> TakeVoice() {
+    std::lock_guard lock(S().vitals_mu);
+    std::vector<std::pair<int, std::vector<std::uint8_t>>> out(std::make_move_iterator(S().voice.begin()),
+                                                                 std::make_move_iterator(S().voice.end()));
+    S().voice.clear();
+    return out;
+}
+
+void SendBring(int target) {
+    if (!S().host || !S().started.load() || !S().link.Connected()) return;
+    const std::uint8_t frame[1] = {kBring};
+    S().link.Send(target, frame, sizeof frame);
+    {
+        std::lock_guard lock(S().status_mu);
+        S().status.ClearAsk(target);
+    }
+    Log("the host calls %s to its side", target ? ("slot " + std::to_string(target)).c_str() : "everyone");
+}
+
+bool TakeBring() {
+    std::lock_guard lock(S().vitals_mu);
+    if (S().bring_at == Clock::time_point{}) return false;
+    const bool fresh = Clock::now() - S().bring_at < std::chrono::seconds(10);
+    S().bring_at = {};
+    return fresh;
+}
+
+std::vector<PeerStatus> Connections() {
+    std::lock_guard lock(S().status_mu);
+    return S().status.List(Clock::now());
+}
+
+std::vector<PartyLine> PartyLines() {
+    std::lock_guard lock(S().status_mu);
+    return S().status.Lines(Clock::now());
+}
+
+bool CurrentReconnect(ReconnectNotice& out) {
+    std::lock_guard lock(S().status_mu);
+    return S().status.Reconnecting(Clock::now(), out);
+}
+
+bool LinkUp() {
+    return S().link.Connected();
+}
+
+void SendWarpAsk() {
+    if (S().host || !S().started.load()) return;
+    const auto now = Clock::now();
+    std::lock_guard lock(S().status_mu);
+    if (S().status.GuestWaiting(now)) return;
+    const int host = S().link.HostSlot();
+    const std::uint8_t frame[1] = {kWarpAsk};
+    if (!host || !S().link.Connected() || !S().link.Send(host, frame, sizeof frame)) {
+        S().status.AddLine(PartyLineKind::WarpNoAnswer, {}, now);
+        return;
+    }
+    S().status.GuestAsked(now);
+    Log("asked the host to bring this hunter over");
+}
+
+bool WarpWaiting() {
+    std::lock_guard lock(S().status_mu);
+    return S().status.GuestWaiting(Clock::now());
+}
+
+void SetWarpRequests(bool on) {
+    S().warp_requests = on;
+}
+
+void SendLampAsk(std::uint32_t lamp) {
+    if (S().host || !S().started.load()) return;
+    const auto now = Clock::now();
+    std::lock_guard lock(S().status_mu);
+    if (S().status.GuestLampWaiting(now)) return;
+    const int host = S().link.HostSlot();
+    std::uint8_t frame[5] = {kLampAsk};
+    std::memcpy(frame + 1, &lamp, 4);
+    if (!host || !S().link.Connected() || !S().link.Send(host, frame, sizeof frame)) {
+        S().status.AddLine(PartyLineKind::LampNoAnswer, {}, now);
+        return;
+    }
+    S().status.GuestLampAsked(now);
+    Log("asked the host to take the party to lamp %u", lamp);
+}
+
+bool PendingLampAsk(int& slot, std::string& who, std::uint32_t& lamp) {
+    std::lock_guard lock(S().status_mu);
+    return S().status.LampAskNow(Clock::now(), slot, who, lamp);
+}
+
+void AnswerLampAsk(bool yes) {
+    int slot = 0;
+    std::string who;
+    std::uint32_t lamp = 0;
+    {
+        std::lock_guard lock(S().status_mu);
+        if (!S().status.LampAskNow(Clock::now(), slot, who, lamp)) return;
+        S().status.LampAskDone();
+    }
+    const std::uint8_t answer[2] = {kLampAnswer, yes ? std::uint8_t(kLampAgreed) : std::uint8_t(kLampRefused)};
+    S().link.Send(slot, answer, sizeof answer);
+    Log("the host %s the party's travel to lamp %u", yes ? "accepted" : "refused", lamp);
+}
+
+void NoteBringFar() {
+    AddPartyLine(PartyLineKind::BringFar, {});
+}
+
+bool CurrentAnnouncement(std::string& text, float& alpha) {
+    std::lock_guard lock(S().announce_mu);
+    return S().announcements.Current(Clock::now(), text, alpha);
+}
+
+bool CurrentNotice(std::string& text) {
+    Notice& n = N();
+    std::lock_guard lock(n.mu);
+    const auto now = Clock::now();
+    const long secs = static_cast<long>(std::chrono::duration_cast<std::chrono::seconds>(now - n.since).count());
+    const auto quiet = now - n.seen;
+    char line[160];
+    switch (n.stage) {
+    case Stage::None:
+        return false;
+    case Stage::Looking:
+    case Stage::Found:
+    case Stage::Calling:
+    case Stage::Waiting:
+        return false;
+    case Stage::Invited:
+        if (quiet > std::chrono::seconds(15)) {
+            if (quiet > std::chrono::seconds(20)) return false;
+            std::snprintf(line, sizeof line, "%s's summon did not go through: ring again", n.who.c_str());
+            break;
+        }
+        std::snprintf(line, sizeof line, "Joining %s's world... %ld s", n.who.c_str(), secs);
+        break;
+    case Stage::Arrived:
+        if (quiet > std::chrono::seconds(4)) return false;
+        std::snprintf(line, sizeof line, "In %s's world", n.who.empty() ? "the host" : n.who.c_str());
+        break;
+    case Stage::Home:
+        if (quiet > std::chrono::seconds(4)) return false;
+        std::snprintf(line, sizeof line, "Back in your own world");
+        break;
+    case Stage::HostOnly:
+        if (quiet > std::chrono::seconds(6)) return false;
+        std::snprintf(line, sizeof line, "Only the host can summon: ring the Small Resonant Bell to help");
+        break;
+    case Stage::Failed:
+        if (quiet > std::chrono::seconds(6)) return false;
+        std::snprintf(line, sizeof line, "Could not connect: ring again");
+        break;
+    }
+    text = line;
+    return true;
 }
 
 } // namespace BbRoom

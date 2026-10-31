@@ -301,7 +301,8 @@ struct Section {
 constexpr Section kSections[] = {
     {"PCGraphics", 117020, 6, true}, {"PCControls", 118020, 8, false}, {"PCKeys", 119020, 8, false},
     {"PCEffects", 120020, 5, true},  {"PCCamera", 121020, 3, true},    {"PCEnhance", 124020, 3, true},
-    {"PCColour", 125020, 5, true},
+    {"PCColour", 125020, 5, true},   {"PCLighting", 126020, 8, true},  {"PCDetail", 127020, 8, true},
+    {"PCLooks", 128020, 1, false},
 };
 constexpr int kDonorRows = 6, kDonorDefaults = 6;
 constexpr std::uint16_t kFirstSectionDepth = 383;
@@ -511,6 +512,7 @@ const char kTsv[] =
 #include "pc_option_messages.inc"
     ;
 
+constexpr std::int32_t kHostRole = 107000, kGuestRole = 107100;
 constexpr std::uint32_t kMenuGroup = 200, kHelpGroup = 201, kQuestionGroup = 78, kScreenQuestionGroup = 204, kEventGroup = 30;
 
 std::string Unescape(std::string s) {
@@ -742,7 +744,7 @@ Bytes MenuMessages(const Bytes& file, bool chinese) {
     return MenuMessages(file, chinese ? Language::Chinese : Language::English);
 }
 
-Bytes MenuMessages(const Bytes& file, Language language) {
+Bytes MenuMessages(const Bytes& file, Language language, const PlateTitles& titles) {
     const bool packed = Has(file, 0, "DCX\0", 4);
     Dcx dcx = packed ? DcxRead(file) : Dcx{{}, file};
     Binder bundle = BinderRead(dcx.data);
@@ -767,6 +769,10 @@ Bytes MenuMessages(const Bytes& file, Language language) {
                 throw Error("message " + std::to_string(id) + " is already in group " + std::to_string(g->id));
             const std::string& s = g->help ? m.help : m.text;
             fmg.text[id] = s.empty() ? std::nullopt : std::optional<std::u16string>(Utf16(s));
+        }
+        if (g->kind == Kind::Event) {
+            if (titles.host && fmg.text.count(kHostRole)) fmg.text[kHostRole] = Utf16(*titles.host);
+            if (titles.guest && fmg.text.count(kGuestRole)) fmg.text[kGuestRole] = Utf16(*titles.guest);
         }
         file_in.data = FmgWrite(fmg);
         g->found = true;

@@ -18,10 +18,13 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "bbport_toggles.h"
+#include "lantern_anti_lag.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_streamline.h"
 #include "video_core/renderer_vulkan/vk_fsr4vk.h"
+#include "video_core/renderer_vulkan/vk_fsr_sdk.h"
 #include "video_core/renderer_vulkan/vk_occlusion.h"
 #include "video_core/renderer_vulkan/vk_optiscaler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -93,7 +96,7 @@ static void HideExtensions(std::vector<std::string>& available) {
     static constexpr std::string_view amd_only[] = {
         "VK_AMD_gcn_shader", "VK_AMD_mixed_attachment_samples",
         "VK_AMD_shader_explicit_vertex_parameter", "VK_AMD_shader_image_load_store_lod",
-        "VK_AMD_shader_trinary_minmax"};
+        "VK_AMD_shader_trinary_minmax", "VK_AMD_anti_lag"};
     static constexpr std::string_view nvidia_only[] = {
         "VK_NV_framebuffer_mixed_samples", "VK_NVX_binary_import", "VK_NVX_image_view_handle",
         "VK_NV_low_latency2"};
@@ -114,7 +117,7 @@ static void HideExtensions(std::vector<std::string>& available) {
                            {"VK_EXT_vertex_input_dynamic_state", "VK_EXT_image_2d_view_of_3d",
                             "VK_KHR_maintenance5", "VK_KHR_maintenance8",
                             "VK_KHR_compute_shader_derivatives", "VK_KHR_cooperative_matrix",
-                            "VK_EXT_shader_atomic_float2"});
+                            "VK_EXT_shader_atomic_float2", "VK_AMD_anti_lag"});
             }
         }
         return set;
@@ -287,6 +290,7 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
 
 Instance::~Instance() {
     // bbport: Streamline goes before the device (the presenter's swapchain went already).
+    LanternAntiLag::Shutdown();
     Streamline::Shutdown();
     ImGui::Core::Shutdown(GetDevice());
     vmaDestroyAllocator(allocator);
@@ -326,7 +330,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceCooperativeMatrixFeaturesKHR, vk::PhysicalDeviceShaderFloat8FeaturesEXT,
         vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT,
         vk::PhysicalDeviceDescriptorBufferFeaturesEXT, vk::PhysicalDeviceFaultFeaturesEXT,
-        vk::PhysicalDeviceAddressBindingReportFeaturesEXT>();
+        vk::PhysicalDeviceAddressBindingReportFeaturesEXT,
+        vk::PhysicalDeviceAntiLagFeaturesAMD>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -538,6 +543,12 @@ bool Instance::CreateDevice() {
         low_latency_boost = add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
                             add_extension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
     }
+    if (LanternAntiLag::Allowed() && !Streamline::Loaded() && !OptiScaler::Detect().loaded &&
+        feature_chain.get<vk::PhysicalDeviceAntiLagFeaturesAMD>().antiLag &&
+        std::ranges::find(available_extensions, std::string{VK_AMD_ANTI_LAG_EXTENSION_NAME}) !=
+            available_extensions.end()) {
+        anti_lag = add_extension(VK_AMD_ANTI_LAG_EXTENSION_NAME);
+    }
     // bbport (Windows): BB_EXCLUSIVE_FULLSCREEN=0 keeps the swapchain from ever becoming
     // exclusive fullscreen (vk_swapchain.cpp), so a driver cannot switch Windows HDR off for an
     // SDR image. Off by default: the driver's exclusive mode has the lowest latency and keeps
@@ -632,6 +643,14 @@ bool Instance::CreateDevice() {
     } else if (Fsr4Vk::FilesPresent()) {
         std::printf("Upscaler: fsr4vk found, but this GPU lacks a Vulkan feature it needs: no FSR 4.1.1\n");
     }
+    fsr_sdk = FsrSdk::FilesPresent() && features.shaderStorageImageWriteWithoutFormat &&
+              vk13_features.synchronization2;
+    if (fsr_sdk) {
+        std::printf("Upscaler: AMD FSR SDK 2.4 found (%s)\n", FsrSdk::DirectoryUtf8().c_str());
+    } else if (FsrSdk::FilesPresent()) {
+        std::printf("Upscaler: AMD FSR SDK found, but this GPU lacks a Vulkan feature it needs\n");
+    }
+    const bool fsr_shared = fsr4vk || fsr_sdk;
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = queue_info_count,
@@ -664,8 +683,9 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
-                // bbport: fsr4vk (vk_fsr4vk.cpp) only.
-                .shaderStorageImageReadWithoutFormat = fsr4vk,
+                // bbport: fsr4vk (vk_fsr4vk.cpp) and the AMD FSR SDK (vk_fsr_sdk.cpp).
+                .shaderStorageImageReadWithoutFormat =
+                    fsr4vk || (fsr_sdk && features.shaderStorageImageReadWithoutFormat),
                 // bbport: required by the FSR 3 accumulate shaders (vk_temporal_upscaler).
                 .shaderStorageImageWriteWithoutFormat =
                     features.shaderStorageImageWriteWithoutFormat,
@@ -689,9 +709,10 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
-            // bbport: fsr4vk (vk_fsr4vk.cpp) only.
-            .descriptorBindingVariableDescriptorCount = fsr4vk,
-            .runtimeDescriptorArray = fsr4vk,
+            // bbport: fsr4vk (vk_fsr4vk.cpp) and the AMD FSR SDK (vk_fsr_sdk.cpp).
+            .descriptorBindingVariableDescriptorCount =
+                fsr4vk || (fsr_shared && vk12_features.descriptorBindingVariableDescriptorCount),
+            .runtimeDescriptorArray = fsr4vk || (fsr_shared && vk12_features.runtimeDescriptorArray),
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
@@ -814,8 +835,14 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceAddressBindingReportFeaturesEXT{
             .reportAddressBinding = true,
         },
+        vk::PhysicalDeviceAntiLagFeaturesAMD{
+            .antiLag = true,
+        },
     };
 
+    if (!anti_lag) {
+        device_chain.unlink<vk::PhysicalDeviceAntiLagFeaturesAMD>();
+    }
     if (!custom_border_color) {
         device_chain.unlink<vk::PhysicalDeviceCustomBorderColorFeaturesEXT>();
     }
@@ -901,6 +928,9 @@ bool Instance::CreateDevice() {
         return false;
     }
     device = std::move(dev);
+    if (anti_lag) {
+        LanternAntiLag::Start(*device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+    }
     // bbport: created through Streamline's proxy when it is loaded: DLSS Frame Generation's
     // support on this GPU (vk_streamline.h).
     Streamline::OnDeviceCreated(physical_device);
@@ -1069,6 +1099,40 @@ void Instance::CollectPhysicalMemoryInfo() {
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
+    u32 largest_heap = 0;
+    u64 largest_heap_size = 0;
+    for (u32 i = 0; i < num_props; ++i) {
+        if ((memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) &&
+            memory_props.memoryHeaps[i].size > largest_heap_size) {
+            largest_heap = i;
+            largest_heap_size = memory_props.memoryHeaps[i].size;
+        }
+    }
+    const char* low_vram_env = std::getenv("BB_AMD_LOW_VRAM");
+    low_vram_amd = low_vram_env && low_vram_env[0] == '1';
+    if (!low_vram_env && properties.vendorID == 0x1002 && !IsIntegrated() &&
+        largest_heap_size != 0 && largest_heap_size <= 8_GB + 512_MB) {
+        low_vram_amd = true;
+    }
+    if (low_vram_amd) {
+        const char* images_env = std::getenv("BB_LOW_VRAM_IMAGES");
+        u32 image_types = 0;
+        if (!(images_env && images_env[0] == '0')) {
+            for (u32 i = 0; i < memory_props.memoryTypeCount; ++i) {
+                const auto& type = memory_props.memoryTypes[i];
+                if (type.heapIndex == largest_heap &&
+                    (type.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+                    !(type.propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible)) {
+                    image_types |= 1u << i;
+                }
+            }
+        }
+        VideoCore::low_vram_image_types.store(image_types, std::memory_order_relaxed);
+        VideoCore::low_vram_buffers.store(true, std::memory_order_relaxed);
+        std::printf("GPU: low-VRAM rules on, largest VRAM heap %llu MiB (BB_AMD_LOW_VRAM=0: off; "
+                    "BB_LOW_VRAM_GC=0, BB_LOW_VRAM_STAGING=0, BB_LOW_VRAM_IMAGES=0)\n",
+                    (unsigned long long)(largest_heap_size >> 20));
+    }
     if (!IsIntegrated()) {
         // We reserve some memory for the system.
         const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
@@ -1150,6 +1214,16 @@ u64 Instance::GetDeviceMemoryUsage() const {
         total_usage += memory_budget_props.heapUsage[heap];
     }
     return total_usage;
+}
+
+u64 Instance::GetVmaFreeInBlocks() const {
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(allocator, budgets);
+    u64 free_bytes = 0;
+    for (const size_t heap : valid_heaps) {
+        free_bytes += budgets[heap].statistics.blockBytes - budgets[heap].statistics.allocationBytes;
+    }
+    return free_bytes;
 }
 
 u64 Instance::GetDeviceMemoryBudgetNow() const {

@@ -25,14 +25,11 @@ namespace BloodborneLauncher.Views
             // own AMD DLL: offered when either is there. Without both the setting becomes FSR 4, the
             // model it would fall back to (#22).
             var fsr411 = Fsr4VkFound() || Directory.Exists(Fsr411Dir());
+            if (Ini.Get("upscaler") == "fsr") Ini.Set("upscaler", "fsr4");
             if (!fsr411 && Ini.Get("upscaler") == "fsr411") Ini.Set("upscaler", "fsr4");
             IniCombo(SymbolRegular.Sparkle24, L.T("Upscaler"), null,
                 fsr411 ? Choices.Upscalers : Choices.Upscalers.Where(c => c.Value != "fsr411").ToArray(), "upscaler", changed: UpdateUpscaler);
             _upscalerHint = (TextBlock)((SettingRow)Body.Children[^1]).Tag!;
-            if (AmdFsrDriver.ProviderPath() is { } amdFsr)
-                Add(Card(SymbolRegular.Sparkle24, L.T("FSR 4 from your AMD driver"),
-                    L.F($"Your AMD driver has its own FSR 4 provider (driver {AmdFsrDriver.DriverVersion(amdFsr)}). Turn on \"FSR 4 from the AMD driver\" in Engine switches to use the driver's FSR 4 version: FSR 4.1.2 on Adrenalin 26.10.1 and newer. Being tested on RX 9000 cards"),
-                    null, out _));
 
             IniCombo(SymbolRegular.ZoomIn24, L.T("Quality preset"), L.T("How far below the output resolution the game renders"),
                 Choices.Presets, "preset", changed: UpdateUpscaler);
@@ -185,6 +182,15 @@ namespace BloodborneLauncher.Views
                 IniToggle(EffectIcon(effect.Key), effect.Title, effect.Hint, effect.Key, changed: motionBlur ? UpdateUpscaler : null);
                 if (motionBlur) _motionBlurHint = ((SettingRow)Body.Children[^1]).Hint;
             }
+
+            Group(L.T("Lighting"));
+            IniCombo(SymbolRegular.Lightbulb24, L.T("Sun shadow resolution"), L.T("Applied when the game starts"), Choices.ShadowResolution, "graphics_shadow_resolution");
+            IniCombo(SymbolRegular.Lightbulb24, L.T("Lamp shadow resolution"), L.T("Applied when the game starts"), Choices.LocalShadowResolution, "graphics_local_shadow_resolution");
+            IniCombo(SymbolRegular.Lightbulb24, L.T("Motion blur quality"), L.T("Applied when the game starts"), Choices.MotionBlurQuality, "graphics_motion_blur_quality");
+            IniSlider(SymbolRegular.Lightbulb24, L.T("Indirect lighting strength"), 0, 12, "graphics_gi_strength", fallback: 6);
+            IniSlider(SymbolRegular.Lightbulb24, L.T("Reflection strength"), 0, 3, "graphics_ssr_intensity");
+            IniSlider(SymbolRegular.Lightbulb24, L.T("Volumetric sunlight strength"), 0, 3, "graphics_volumetric_intensity");
+            IniSlider(SymbolRegular.Lightbulb24, L.T("Lamp fog strength"), 0, 3, "graphics_point_fog_intensity");
 
             Ws.PortChanged += UpdateUpscaler;
         }
