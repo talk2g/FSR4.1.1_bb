@@ -326,11 +326,15 @@ target_link_libraries(pipeline-archive-test PRIVATE fmt::fmt)
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
 target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(motion-history-test PRIVATE ..)
+add_executable(lamp-fog-lights-test EXCLUDE_FROM_ALL ../tests/test_lamp_fog_lights.cpp)
+target_compile_options(lamp-fog-lights-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(lamp-fog-lights-test PRIVATE ..)
 foreach(effect_test
         "motion-blur-shader-test;test_motion_blur.cpp"
         "directional-shadow-test;test_directional_shadows.cpp"
         "rt-shadow-test;test_rt_shadows.cpp"
         "point-volumetric-test;test_point_volumetric.cpp"
+        "volumetric-tint-test;test_volumetric_tint.cpp"
         "effect-pipelines-test;test_effect_pipelines.cpp")
     list(GET effect_test 0 effect_test_name)
     list(GET effect_test 1 effect_test_source)
